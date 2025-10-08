@@ -5,12 +5,12 @@ import json
 import signal
 import logging
 import contextlib
+import time
 from dotenv import load_dotenv
+import websockets
 import lighter
 import eth_account
-import websockets
 
-# only show our prints
 logging.disable(logging.CRITICAL)
 load_dotenv()
 
@@ -20,9 +20,31 @@ API_KEY_INDEX = int(os.getenv("API_KEY_INDEX"))
 API_KEY_PRIVATE_KEY = os.getenv("API_KEY_PRIVATE_KEY")
 WS_URL = BASE_URL.replace("https", "wss") + "/stream"
 
-MARKET_ID = 0  # ETH
+MARKET_ID = 0
+PRICE_SCALE = 100
+BASE_SCALE = 10000
+MAX_SLIPPAGE = 0.001  # 1%
 
-# ---------- helpers ----------
+MARGIN = 10.0
+LEVERAGE = 20.0
+
+SHORT = True
+LONG = False
+
+ORDER = SHORT
+
+
+def next_coi() -> int:
+    return int(time.time() * 1000)
+
+
+def to_int_price(p: float) -> int:
+    return int(round(p * PRICE_SCALE))
+
+
+def base_amount_from_notional_usd(notional_usd: float, price: float) -> int:
+    size_eth = notional_usd / price
+    return int(round(size_eth * BASE_SCALE))
 
 
 async def init_signer():
@@ -44,61 +66,26 @@ async def init_signer():
     return signer, api_client
 
 
-async def open_ws():
-    ws = await websockets.connect(WS_URL, ping_interval=None)
-    with contextlib.suppress(asyncio.TimeoutError):
-        await asyncio.wait_for(ws.recv(), timeout=2)  # drain hello if any
-    return ws
-
-
-async def subscribe_market(ws, market_id: int):
-    await ws.send(json.dumps({"type": "subscribe", "channel": f"market_stats/{market_id}"}))
-    print(f"[ws] subscribed: market_stats/{market_id} (Ctrl+C to stop)")
-
-
-async def unsubscribe_market(ws, market_id: int):
-    with contextlib.suppress(Exception):
-        await ws.send(json.dumps({"type": "unsubscribe", "channel": f"market_stats/{market_id}"}))
-        await asyncio.sleep(0.2)
-
-
-def install_signal_handlers(stop: asyncio.Event):
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, stop.set)
-
-
-def handle_market_stats(msg):
-    if msg.get("type") != "update/market_stats":
-        return
-    s = msg.get("market_stats") or {}
-    # for single-market channel, market_stats is a single object, not a dict
-    mid = s.get("market_id")
-    mark = s.get("mark_price")
-    last = s.get("last_trade_price")
-    oi = s.get("open_interest")
-    fr = s.get("current_funding_rate")
-    print(f"[ETH] id={mid} mark={mark} last={last} oi={oi} funding={fr}")
-
-
-async def stream_eth(stop: asyncio.Event):
-    ws = await open_ws()
-    try:
-        await subscribe_market(ws, MARKET_ID)
-        while not stop.is_set():
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-            except asyncio.TimeoutError:
+async def get_mark_price_once(market_id: int) -> float:
+    async with websockets.connect(WS_URL, ping_interval=None) as ws:
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(ws.recv(), timeout=2)
+        await ws.send(json.dumps({"type": "subscribe", "channel": f"market_stats/{market_id}"}))
+        while True:
+            raw = await asyncio.wait_for(ws.recv(), timeout=5)
+            msg = json.loads(raw)
+            if msg.get("type") != "update/market_stats":
                 continue
-            except (asyncio.CancelledError, websockets.ConnectionClosed):
-                break
-            with contextlib.suppress(json.JSONDecodeError):
-                handle_market_stats(json.loads(raw))
-    finally:
-        await unsubscribe_market(ws, MARKET_ID)
-        await ws.close()
-        print("[ws] closed")
+            s = msg.get("market_stats") or {}
+            if s.get("market_id") != market_id:
+                continue
+            mark = s.get("mark_price")
+            if mark:
+                price = float(mark)
+                with contextlib.suppress(Exception):
+                    await ws.send(json.dumps({"type": "unsubscribe", "channel": f"market_stats/{market_id}"}))
+                    await asyncio.sleep(0.1)
+                return price
 
 
 async def main():
@@ -106,20 +93,64 @@ async def main():
         raise RuntimeError("Missing keys in .env")
 
     signer, api_client = await init_signer()
-
-    stop = asyncio.Event()
-    install_signal_handlers(stop)
-    task = asyncio.create_task(stream_eth(stop))
-
     try:
-        await task
-    except KeyboardInterrupt:
-        stop.set()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        # --- get current price
+        mark = await get_mark_price_once(MARKET_ID)
+        ideal_price_int = to_int_price(mark)
+
+        # --- compute notional from desired margin × assumed leverage
+        notional_usd = MARGIN * LEVERAGE  # e.g., $10 × 20x = $200
+        base_amt_int = base_amount_from_notional_usd(notional_usd, mark)
+
+        # --- Open
+        coi = next_coi()
+        print(f"[open] Create notional=${notional_usd:.2f} (margin≈${MARGIN:.2f}) "
+              f"base_int={base_amt_int} mark≈{mark:.2f} slippage=1% coi={coi}")
+
+        _, tx_hash, err = await signer.create_market_order_if_slippage(
+            market_index=MARKET_ID,
+            client_order_index=coi,
+            base_amount=base_amt_int,
+            max_slippage=MAX_SLIPPAGE,
+            is_ask=ORDER,
+            ideal_price=ideal_price_int
+        )
+        if err:
+            print(f"[open] error: {err}")
+        else:
+            print(f"[open] submitted tx_hash={tx_hash}")
+
+        print("[run] Ctrl+C to CLOSE position (sell same size)")
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError):
+                loop.add_signal_handler(sig, stop.set)
+        await stop.wait()
+
+        # --- Close
+        mark_exit = await get_mark_price_once(MARKET_ID)
+        ideal_price_int_exit = to_int_price(mark_exit)
+        print(
+            f"[close] SELL base_int={base_amt_int} mark≈{mark_exit:.2f} slippage=1% coi={coi}")
+
+        _, tx_hash, err = await signer.create_market_order_if_slippage(
+            market_index=MARKET_ID,
+            client_order_index=coi,
+            base_amount=base_amt_int,
+            max_slippage=MAX_SLIPPAGE,
+            is_ask=not ORDER,
+            ideal_price=ideal_price_int_exit
+        )
+        if err:
+            print(f"[close] error: {err}")
+        else:
+            print(f"[close] submitted tx_hash={tx_hash}")
+
     finally:
         await signer.close()
         await api_client.close()
+        print("[done] closed")
 
 if __name__ == "__main__":
     asyncio.run(main())
