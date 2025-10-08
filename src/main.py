@@ -1,3 +1,4 @@
+# src/main.py
 import asyncio
 import os
 import json
@@ -9,7 +10,7 @@ import lighter
 import eth_account
 import websockets
 
-# Only show our prints
+# only show our prints
 logging.disable(logging.CRITICAL)
 load_dotenv()
 
@@ -18,6 +19,8 @@ ETH_PRIVATE_KEY = os.getenv("ETH_PRIVATE_KEY")
 API_KEY_INDEX = int(os.getenv("API_KEY_INDEX"))
 API_KEY_PRIVATE_KEY = os.getenv("API_KEY_PRIVATE_KEY")
 WS_URL = BASE_URL.replace("https", "wss") + "/stream"
+
+MARKET_ID = 0  # ETH
 
 # ---------- helpers ----------
 
@@ -43,20 +46,19 @@ async def init_signer():
 
 async def open_ws():
     ws = await websockets.connect(WS_URL, ping_interval=None)
-    # drain hello if any
     with contextlib.suppress(asyncio.TimeoutError):
-        await asyncio.wait_for(ws.recv(), timeout=2)
+        await asyncio.wait_for(ws.recv(), timeout=2)  # drain hello if any
     return ws
 
 
-async def subscribe_markets_all(ws):
-    await ws.send(json.dumps({"type": "subscribe", "channel": "market_stats/all"}))
-    print("[ws] subscribed: market_stats/all (Ctrl+C to stop)")
+async def subscribe_market(ws, market_id: int):
+    await ws.send(json.dumps({"type": "subscribe", "channel": f"market_stats/{market_id}"}))
+    print(f"[ws] subscribed: market_stats/{market_id} (Ctrl+C to stop)")
 
 
-async def unsubscribe_markets_all(ws):
+async def unsubscribe_market(ws, market_id: int):
     with contextlib.suppress(Exception):
-        await ws.send(json.dumps({"type": "unsubscribe", "channel": "market_stats/all"}))
+        await ws.send(json.dumps({"type": "unsubscribe", "channel": f"market_stats/{market_id}"}))
         await asyncio.sleep(0.2)
 
 
@@ -67,24 +69,23 @@ def install_signal_handlers(stop: asyncio.Event):
             loop.add_signal_handler(sig, stop.set)
 
 
-def handle_market_stats(msg, seen: set):
+def handle_market_stats(msg):
     if msg.get("type") != "update/market_stats":
         return
-    markets_obj = msg.get("market_stats") or {}
-    for mid_str, s in markets_obj.items():
-        mid = int(mid_str)
-        if mid in seen:
-            continue
-        seen.add(mid)
-        print(
-            f"[market] id={mid} mark={s.get('mark_price')} last={s.get('last_trade_price')} vol_q={s.get('daily_quote_token_volume')}")
+    s = msg.get("market_stats") or {}
+    # for single-market channel, market_stats is a single object, not a dict
+    mid = s.get("market_id")
+    mark = s.get("mark_price")
+    last = s.get("last_trade_price")
+    oi = s.get("open_interest")
+    fr = s.get("current_funding_rate")
+    print(f"[ETH] id={mid} mark={mark} last={last} oi={oi} funding={fr}")
 
 
-async def stream_markets(stop: asyncio.Event):
-    seen = set()
+async def stream_eth(stop: asyncio.Event):
     ws = await open_ws()
     try:
-        await subscribe_markets_all(ws)
+        await subscribe_market(ws, MARKET_ID)
         while not stop.is_set():
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
@@ -93,11 +94,11 @@ async def stream_markets(stop: asyncio.Event):
             except (asyncio.CancelledError, websockets.ConnectionClosed):
                 break
             with contextlib.suppress(json.JSONDecodeError):
-                handle_market_stats(json.loads(raw), seen)
+                handle_market_stats(json.loads(raw))
     finally:
-        await unsubscribe_markets_all(ws)
+        await unsubscribe_market(ws, MARKET_ID)
         await ws.close()
-        print(f"[markets] discovered total={len(seen)}")
+        print("[ws] closed")
 
 
 async def main():
@@ -108,7 +109,7 @@ async def main():
 
     stop = asyncio.Event()
     install_signal_handlers(stop)
-    task = asyncio.create_task(stream_markets(stop))
+    task = asyncio.create_task(stream_eth(stop))
 
     try:
         await task
