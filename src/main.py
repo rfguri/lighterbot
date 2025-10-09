@@ -26,14 +26,14 @@ BASE_SCALE = 10000
 MAX_SLIPPAGE = 0.01  # 1%
 
 MARGIN = 10.0      # margin in USD
-LEVERAGE = 20.0    # assumed leverage => exposure = MARGIN * LEVERAGE
+LEVERAGE = 20.0    # => exposure = 200 USD
 
-SHORT = True      # is_ask=True  -> sell/short
-LONG = False     # is_ask=False -> buy/long
-ORDER = SHORT     # toggle long/short
+SHORT = True       # is_ask=True  -> sell/short
+LONG = False       # is_ask=False -> buy/long
+ORDER = SHORT      # toggle
 
-TP_USD = 1.00     # +$1 from entry mark
-SL_USD = 1.00     # -$1 from entry mark
+TP_USD = 0.1      # take +$0.1 PnL
+SL_USD = 0.1      # stop -$0.1 PnL
 
 
 def next_coi() -> int:
@@ -75,7 +75,7 @@ async def init_signer():
 async def get_mark_price_once(market_id: int) -> float:
     async with websockets.connect(WS_URL, ping_interval=None) as ws:
         with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(ws.recv(), timeout=2)  # drain hello if any
+            await asyncio.wait_for(ws.recv(), timeout=2)
         await ws.send(json.dumps({"type": "subscribe", "channel": f"market_stats/{market_id}"}))
         while True:
             raw = await asyncio.wait_for(ws.recv(), timeout=5)
@@ -105,27 +105,41 @@ async def main():
         # --- price + sizing ---
         mark = await get_mark_price_once(MARKET_ID)
         mark_int = to_int_price(mark)
-        notional_usd = MARGIN * LEVERAGE                 # $10 × 20x = $200 exposure
+
+        notional_usd = MARGIN * LEVERAGE                 # e.g., $200 exposure
         base_amt_int = base_amount_from_notional_usd(notional_usd, mark)
+        # base size in ETH (float)
+        qty_eth = base_amt_int / BASE_SCALE
 
         # Entry IOC limit to emulate market with slippage cap
         entry_price_int = int(round(mark_int * (1 + MAX_SLIPPAGE))
                               ) if ORDER is LONG else int(round(mark_int * (1 - MAX_SLIPPAGE)))
 
-        # TP/SL absolute-dollar offsets from current mark
+        # --- compute TP/SL by desired PnL in USD ---
+        # Δp = PnL_target / qty
+        if qty_eth <= 0:
+            raise RuntimeError(
+                "Computed qty is zero; increase exposure or check scales.")
+
+        dp_tp = TP_USD / qty_eth    # price move for +TP_USD
+        dp_sl = SL_USD / qty_eth    # price move for -SL_USD
+
         if ORDER is LONG:
-            tp_price_int = to_int_price(mark + TP_USD)   # profit above
-            sl_price_int = to_int_price(mark - SL_USD)   # stop below
-            tp_is_ask = sl_is_ask = True                 # sell to exit long
+            tp_price_float = mark + dp_tp
+            sl_price_float = mark - dp_sl
+            tp_is_ask = sl_is_ask = True   # sell to exit long
         else:
-            tp_price_int = to_int_price(mark - TP_USD)   # profit below
-            sl_price_int = to_int_price(mark + SL_USD)   # stop above
-            tp_is_ask = sl_is_ask = False                # buy to exit short
+            tp_price_float = mark - dp_tp
+            sl_price_float = mark + dp_sl
+            tp_is_ask = sl_is_ask = False  # buy to exit short
+
+        tp_price_int = to_int_price(tp_price_float)
+        sl_price_int = to_int_price(sl_price_float)
 
         print(f"[plan] side={'LONG' if ORDER is LONG else 'SHORT'} "
-              f"mark≈{mark:.2f} entry_cap≈{from_int_price(entry_price_int):.2f} "
-              f"TP≈{from_int_price(tp_price_int):.2f} SL≈{from_int_price(sl_price_int):.2f} "
-              f"base_int={base_amt_int} notional≈${notional_usd:.2f}")
+              f"mark≈{mark:.2f} qty≈{qty_eth:.6f} "
+              f"TP(+${TP_USD})≈{tp_price_float:.2f} SL(-${SL_USD})≈{sl_price_float:.2f} "
+              f"entry_cap≈{from_int_price(entry_price_int):.2f} base_int={base_amt_int}")
 
         # --- nonces for batch ---
         next_nonce = await tx_api.next_nonce(account_index=account_index, api_key_index=API_KEY_INDEX)
@@ -145,7 +159,7 @@ async def main():
             price=entry_price_int,
             is_ask=ORDER,  # False=BUY/long, True=SELL/short
             order_type=signer.ORDER_TYPE_LIMIT,
-            time_in_force=signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,  # IOC = instant execute
+            time_in_force=signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,  # IOC
             reduce_only=False,
             trigger_price=0,
             nonce=nonce
@@ -154,12 +168,12 @@ async def main():
         if err:
             raise RuntimeError(f"sign entry error: {err}")
 
-        # --- sign FULL-SIZE TP (reduce-only, 100%) ---
+        # --- sign FULL-SIZE TP (reduce-only) ---
         tp_info, err = signer.sign_create_order(
             market_index=MARKET_ID,
             client_order_index=coi_tp,
-            base_amount=base_amt_int,               # full size
-            price=tp_price_int,
+            base_amount=base_amt_int,
+            price=tp_price_int,          # execution price = trigger (simple)
             is_ask=tp_is_ask,
             order_type=signer.ORDER_TYPE_TAKE_PROFIT_LIMIT,
             time_in_force=signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
@@ -171,11 +185,11 @@ async def main():
         if err:
             raise RuntimeError(f"sign TP error: {err}")
 
-        # --- sign FULL-SIZE SL (reduce-only, 100%) ---
+        # --- sign FULL-SIZE SL (reduce-only) ---
         sl_info, err = signer.sign_create_order(
             market_index=MARKET_ID,
             client_order_index=coi_sl,
-            base_amount=base_amt_int,               # full size
+            base_amount=base_amt_int,
             price=sl_price_int,
             is_ask=sl_is_ask,
             order_type=signer.ORDER_TYPE_STOP_LOSS_LIMIT,
@@ -201,7 +215,6 @@ async def main():
     finally:
         await signer.close()
         await api_client.close()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
