@@ -23,17 +23,17 @@ WS_URL = BASE_URL.replace("https", "wss") + "/stream"
 MARKET_ID = 0
 PRICE_SCALE = 100
 BASE_SCALE = 10000
-MAX_SLIPPAGE = 0.001  # 0.1% (your previous value)
+MAX_SLIPPAGE = 0.01  # 1%
 
-MARGIN = 10.0
-LEVERAGE = 20.0
+MARGIN = 10.0      # margin in USD
+LEVERAGE = 20.0    # assumed leverage => exposure = MARGIN * LEVERAGE
 
-SHORT = True     # is_ask=True  -> sell/short
-LONG = False    # is_ask=False -> buy/long
-ORDER = SHORT    # toggle
+SHORT = True      # is_ask=True  -> sell/short
+LONG = False     # is_ask=False -> buy/long
+ORDER = SHORT     # toggle long/short
 
 TP_USD = 1.00     # +$1 from entry mark
-SL_USD = 0.50     # -$0.5 from entry mark
+SL_USD = 1.00     # -$1 from entry mark
 
 
 def next_coi() -> int:
@@ -42,6 +42,10 @@ def next_coi() -> int:
 
 def to_int_price(p: float) -> int:
     return int(round(p * PRICE_SCALE))
+
+
+def from_int_price(pi: int) -> float:
+    return pi / PRICE_SCALE
 
 
 def base_amount_from_notional_usd(notional_usd: float, price: float) -> int:
@@ -65,13 +69,13 @@ async def init_signer():
     )
     print(
         f"[signer] ready | account_index={account_index} api_key_index={API_KEY_INDEX}")
-    return signer, api_client
+    return signer, api_client, account_index
 
 
 async def get_mark_price_once(market_id: int) -> float:
     async with websockets.connect(WS_URL, ping_interval=None) as ws:
         with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(ws.recv(), timeout=2)
+            await asyncio.wait_for(ws.recv(), timeout=2)  # drain hello if any
         await ws.send(json.dumps({"type": "subscribe", "channel": f"market_stats/{market_id}"}))
         while True:
             raw = await asyncio.wait_for(ws.recv(), timeout=5)
@@ -94,101 +98,110 @@ async def main():
     if not (BASE_URL and ETH_PRIVATE_KEY and API_KEY_PRIVATE_KEY and API_KEY_INDEX):
         raise RuntimeError("Missing keys in .env")
 
-    signer, api_client = await init_signer()
+    signer, api_client, account_index = await init_signer()
+    tx_api = lighter.TransactionApi(api_client)
+
     try:
-        # --- price + size ---
+        # --- price + sizing ---
         mark = await get_mark_price_once(MARKET_ID)
         mark_int = to_int_price(mark)
-        notional_usd = MARGIN * LEVERAGE             # $10 × 20x = $200 exposure
+        notional_usd = MARGIN * LEVERAGE                 # $10 × 20x = $200 exposure
         base_amt_int = base_amount_from_notional_usd(notional_usd, mark)
 
-        # --- entry (market with slippage cap) ---
-        coi_open = next_coi()
-        print(f"[open] {'SHORT' if ORDER else 'LONG'} exposure=${notional_usd:.2f} "
-              f"base_int={base_amt_int} mark≈{mark:.2f} slippage={MAX_SLIPPAGE*100:.2f}% coi={coi_open}")
+        # Entry IOC limit to emulate market with slippage cap
+        entry_price_int = int(round(mark_int * (1 + MAX_SLIPPAGE))
+                              ) if ORDER is LONG else int(round(mark_int * (1 - MAX_SLIPPAGE)))
 
-        # BUY if long (is_ask=False), SELL if short (is_ask=True)
-        _, tx_hash, err = await signer.create_market_order_if_slippage(
-            market_index=MARKET_ID,
-            client_order_index=coi_open,
-            base_amount=base_amt_int,
-            max_slippage=MAX_SLIPPAGE,
-            is_ask=ORDER,
-            ideal_price=mark_int
-        )
-        if err:
-            print(f"[open] error: {err}")
-            return
-        print(f"[open] submitted tx_hash={tx_hash}")
-
-        # --- TP/SL (reduce-only) immediately after entry ---
+        # TP/SL absolute-dollar offsets from current mark
         if ORDER is LONG:
-            tp_price_int = to_int_price(mark + TP_USD)  # above
-            sl_price_int = to_int_price(mark - SL_USD)  # below
-            tp_is_ask = True   # sell to take profit
-            sl_is_ask = True   # sell to stop out
+            tp_price_int = to_int_price(mark + TP_USD)   # profit above
+            sl_price_int = to_int_price(mark - SL_USD)   # stop below
+            tp_is_ask = sl_is_ask = True                 # sell to exit long
         else:
-            tp_price_int = to_int_price(mark - TP_USD)  # below for short
-            sl_price_int = to_int_price(mark + SL_USD)  # above for short
-            tp_is_ask = False  # buy to take profit
-            sl_is_ask = False  # buy to stop out
+            tp_price_int = to_int_price(mark - TP_USD)   # profit below
+            sl_price_int = to_int_price(mark + SL_USD)   # stop above
+            tp_is_ask = sl_is_ask = False                # buy to exit short
 
-        coi_tp = next_coi()
-        tx_tp = await signer.create_tp_order(
+        print(f"[plan] side={'LONG' if ORDER is LONG else 'SHORT'} "
+              f"mark≈{mark:.2f} entry_cap≈{from_int_price(entry_price_int):.2f} "
+              f"TP≈{from_int_price(tp_price_int):.2f} SL≈{from_int_price(sl_price_int):.2f} "
+              f"base_int={base_amt_int} notional≈${notional_usd:.2f}")
+
+        # --- nonces for batch ---
+        next_nonce = await tx_api.next_nonce(account_index=account_index, api_key_index=API_KEY_INDEX)
+        nonce = next_nonce.nonce
+
+        # --- COIs grouped (unique) ---
+        coi_base = next_coi()
+        coi_entry = coi_base
+        coi_tp = coi_base + 1
+        coi_sl = coi_base + 2
+
+        # --- sign entry (IOC LIMIT) ---
+        entry_info, err = signer.sign_create_order(
+            market_index=MARKET_ID,
+            client_order_index=coi_entry,
+            base_amount=base_amt_int,
+            price=entry_price_int,
+            is_ask=ORDER,  # False=BUY/long, True=SELL/short
+            order_type=signer.ORDER_TYPE_LIMIT,
+            time_in_force=signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,  # IOC = instant execute
+            reduce_only=False,
+            trigger_price=0,
+            nonce=nonce
+        )
+        nonce += 1
+        if err:
+            raise RuntimeError(f"sign entry error: {err}")
+
+        # --- sign FULL-SIZE TP (reduce-only, 100%) ---
+        tp_info, err = signer.sign_create_order(
             market_index=MARKET_ID,
             client_order_index=coi_tp,
-            base_amount=base_amt_int,
-            trigger_price=tp_price_int,
+            base_amount=base_amt_int,               # full size
             price=tp_price_int,
             is_ask=tp_is_ask,
-            reduce_only=True
+            order_type=signer.ORDER_TYPE_TAKE_PROFIT_LIMIT,
+            time_in_force=signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+            reduce_only=True,
+            trigger_price=tp_price_int,
+            nonce=nonce
         )
-        print("[tp] submitted:", tx_tp)
+        nonce += 1
+        if err:
+            raise RuntimeError(f"sign TP error: {err}")
 
-        coi_sl = next_coi()
-        tx_sl = await signer.create_sl_order(
+        # --- sign FULL-SIZE SL (reduce-only, 100%) ---
+        sl_info, err = signer.sign_create_order(
             market_index=MARKET_ID,
             client_order_index=coi_sl,
-            base_amount=base_amt_int,
-            trigger_price=sl_price_int,
+            base_amount=base_amt_int,               # full size
             price=sl_price_int,
             is_ask=sl_is_ask,
-            reduce_only=True
+            order_type=signer.ORDER_TYPE_STOP_LOSS_LIMIT,
+            time_in_force=signer.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+            reduce_only=True,
+            trigger_price=sl_price_int,
+            nonce=nonce
         )
-        print("[sl] submitted:", tx_sl)
-
-        # --- wait; Ctrl+C → opposite market to flatten (separate tx) ---
-        print("[run] Ctrl+C to CLOSE position with opposite market order")
-        stop = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            with contextlib.suppress(NotImplementedError):
-                loop.add_signal_handler(sig, stop.set)
-        await stop.wait()
-
-        # --- close with opposite market (with slippage cap) ---
-        mark_exit = await get_mark_price_once(MARKET_ID)
-        price_exit_int = to_int_price(mark_exit)
-        coi_close = next_coi()
-        print(f"[close] opposite market at ≈{mark_exit:.2f} coi={coi_close}")
-
-        _, tx_hash, err = await signer.create_market_order_if_slippage(
-            market_index=MARKET_ID,
-            client_order_index=coi_close,
-            base_amount=base_amt_int,
-            max_slippage=MAX_SLIPPAGE,
-            is_ask=not ORDER,      # opposite side to flatten
-            ideal_price=price_exit_int
-        )
+        nonce += 1
         if err:
-            print(f"[close] error: {err}")
-        else:
-            print(f"[close] submitted tx_hash={tx_hash}")
+            raise RuntimeError(f"sign SL error: {err}")
+
+        # --- batch send (entry + TP + SL) ---
+        tx_types = json.dumps([
+            signer.TX_TYPE_CREATE_ORDER,
+            signer.TX_TYPE_CREATE_ORDER,
+            signer.TX_TYPE_CREATE_ORDER
+        ])
+        tx_infos = json.dumps([entry_info, tp_info, sl_info])
+        tx_hashes = await tx_api.send_tx_batch(tx_types=tx_types, tx_infos=tx_infos)
+        print(f"[batch] sent OK: {tx_hashes}")
 
     finally:
         await signer.close()
         await api_client.close()
-        print("[done] closed")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
